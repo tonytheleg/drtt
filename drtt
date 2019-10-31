@@ -1,0 +1,169 @@
+#!/usr/bin/env python
+
+################################################################################
+# Script Name: DR Task Tool - Slithery Dee Edition                             #
+# Created: 2/17/18 - Last Updated: 3/25/2018                                   #
+# Created By: Antony Natale                                                    #
+# Purpose: The DR Task Tool was designed to simplify service restarts and      #
+# validation tasks during DR tests. This tool can aid in checking port status  #
+# for an application or perform status, starts, stops and restarts on apps.    #
+# The tool was made to be universal so that as new apps are added or removed   #
+# from DR, the script does not need to be edited.                              #
+# Slithery Dee Update: Re-Written in Python to take advantage of the threading #
+# library in Python. Now the tool can perform the action on all the servers in #
+# the cluster at the same time or sequentially                                 # 
+################################################################################
+
+import subprocess
+from time import localtime, strftime
+import argparse
+import threading
+import sys
+
+
+def help_msg(name=None):                                                            
+    return '''
+    DR Task Tool - Used to batch restart services
+
+    drtt [-s] BASE-HOSTNAME CLS-RANGE  SERVICE  ACTION
+    ex. drtt dlppsmallbizwls 01-08 cwsbMS status
+
+    -s performs the specified action sequentially (one at a time)
+
+    For port check only:
+    drtt [-p, --port-number] PORT-NUMBER  BASE-HOSTNAME  CLS-RANGE
+    ex. drtt -p 8020 dlppsmallbizwls 01-08
+    '''
+
+def ssh_test(base_hostname, first_host, last_host):
+
+    # Check connectivity by testing port 22 with netcat
+    print("\nTesting connectivity to hosts in cluster...\n")
+
+    # Loop through cluster range and test connection
+    for i in range(first_host, last_host + 1): 
+        current_host = "%s%0.2d" % (base_hostname, i) # formatting to add leading 0's if needed
+        nc = subprocess.call(["nc", "-z", current_host, "22"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        if not nc == 0:  # If netcat test failed, add to naughty list
+            print("SSH test for " + current_host + " failed...continuing")
+            naughty_list.append(current_host)
+        else:
+            print("SSH test for " + current_host + " successful")
+            server_list.append(current_host) 
+
+    # Check if there are any servers on the naughty list and output
+    if len(naughty_list) > 0:
+        print("\nThe following servers could not be reached on port 22, are not resolving " \
+               "or are unreachable.\nPlease address these manually: ") 
+        print(' '.join(naughty_list))
+        print("\nContinuing with the remainder of servers...\n")
+        
+        # set fail boolean in order to bypass grabbing a finish time
+        global finish_fail    
+        finish_fail = True  # Manual intervention needed - finish time will be off
+
+def port_test(port_number, base_hostname, first_host, last_host):
+
+    # call ssh_test to check hosts can be reached first
+    ssh_test(base_hostname, first_host, last_host)
+    print("\n")
+
+    # check port status on good servers
+    for host in server_list:   
+        print("Checking port " + str(port_number) + " on " + host)
+        ssh = subprocess.Popen(['/usr/bin/ssh', '-q', host, 'netstat', '-anp', '|', 'grep', str(port_number), '|', 'grep', 'LISTEN'], stdout=subprocess.PIPE)        
+        port_status = ssh.stdout.read()
+        print(port_status)
+        
+    # grab times for dr chat
+    get_time(start_time, finish_fail)
+    exit()  
+
+def get_time(start_time, finish_fail):
+
+    # If all went well, grab finish time, otherise you're on your own
+    if finish_fail == True:
+        print("Process Complete\n")
+        print("Start time: " + start_time + " - Finish time: TBD after manual checks\n")
+    else:
+        finish_time = strftime("%I:%M:%S", localtime()) 
+        print("Process Complete\n")
+        print("Start time: " + start_time + " - Finish time: " + finish_time + "\n")
+
+def taskmaster(server, service, action):
+    # Perform the specified action on the hosts and its servers
+    print("Performing " + action + " on " + server)
+
+    # Performs the action in a subshell and grabs the status, assigns to variable
+    task = subprocess.Popen(['/usr/bin/ssh', '-q', server, 'service', service, action], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+    service_check = task.stdout.read()
+    if service_check:     # If its empty, something went wrong
+        print(service_check)
+         
+    else:
+        print(service + " could not be found or " + action + " failed.")
+        print("Please double check and try again.\n")
+        print(task.stderr.read())
+        finish_fail = True # Manual intervention needed - finish time will be off
+        print("Skipping...")
+
+
+### MAIN ###
+
+server_list = []
+naughty_list = [] 
+finish_fail = False # bool to adjust output of finish time in case of failures
+
+
+# Create the argparse to handle command line options and help menu
+parser = argparse.ArgumentParser(usage=help_msg())
+parser.add_argument('base_hostname', help='Host name only (No Numbers ex. dlppsmallbizwls)')
+parser.add_argument('--port-number', '-p', type=int, metavar='PORT-NUMBER', help="Port number to check if listening")
+parser.add_argument('-s', action='store_true', help="Run in serial instead of parallel (one at a time, not entire cluster)")
+parser.add_argument('cls_range', help='Number of hosts in cluster (written as start-finish ex. 01-16)')
+parser.add_argument('service', nargs='?', help='Service/Process to perform an action on (ex. cwsbMS, bofaws)')
+parser.add_argument('action', nargs='?', help='start, stop status or restart')
+args = parser.parse_args()
+
+# If -p flag was not provided....oh you better have all my args!
+if args.port_number is None and (args.service is None or args.action is None):
+    parser.print_help()
+    print("\ndrtt: error: too few arguments provided")
+
+# Slice the cluster range to get the range
+first_host = int(args.cls_range[0:2]) 
+
+if int(args.cls_range[-2:]) == first_host: # if performing action on only one server
+    last_host = int(first_host)            # sets last host to be equal so in function only one is checked
+else:
+    last_host = int(args.cls_range[-2:])  # grabs second number in range
+    
+
+# LETS GET THIS PARTY STARTED!
+# grab the start time for chat updates later
+start_time = strftime("%I:%M:%S", localtime())
+
+# Run port test
+if args.port_number:
+    port_test(args.port_number, args.base_hostname, first_host, last_host)
+else:
+    # If not performing port check, first test ssh connection to perform actions
+    ssh_test(args.base_hostname, first_host, last_host)
+
+print("") # I think I need some space...
+
+if args.s:
+    print("Performing " + action + " sequentially...")
+    # list comprehension to perform one at a time
+    [taskmaster(server, args.service, args.action) for server in server_list]
+else:
+    # create thread for each server and execute them to perform action on all servers at once (threads...glorius threads!)
+    threads = [threading.Thread(target=taskmaster, args=(server, args.service, args.action)) for server in server_list]
+    [thread.start() for thread in threads]
+    [thread.join() for thread in threads]
+
+print("") # It's not you its me...
+
+# Grab the run times for the task for dr chat
+get_time(start_time, finish_fail)
